@@ -40,6 +40,7 @@
 
 #include <cstdio>
 #include <memory>
+#include <limits>
 #include <stdexcept>
 #include <array>
 #include <regex>
@@ -47,11 +48,11 @@
 #include <unordered_map>
 
 #include "frequency_sketch_block_huge.hpp"
+#include "runtime_context.hpp"
 
 // Perf related 
 //#define PERF_PAGES	(1 + (1 << 7))	// Has to be == 1+2^n, 
 #define PERF_PAGES	(1 + (1 << 5))	// Has to be == 1+2^n, 
-#define NPROC 16
 #define NPBUFTYPES 2
 #define LOCAL_DRAM_LOAD 0
 #define REMOTE_DRAM_LOAD 1
@@ -89,18 +90,32 @@ std::deque<float> fast_mem_hit_ratio_window;
 
 //typedef std::tuple<uint64_t,uint64_t> vma_range;
 
-int fd[NPROC][NPBUFTYPES];
-static struct perf_event_mmap_page *perf_page[NPROC][NPBUFTYPES];
+std::vector<std::array<int, NPBUFTYPES>> fd;
+static std::vector<std::array<struct perf_event_mmap_page*, NPBUFTYPES>> perf_page;
 
 std::chrono::steady_clock::time_point periodic_start_time;
 
 // Second chance demotion 
-std::vector<uint64_t> second_chance_queue;
+std::vector<PageKey> second_chance_queue;
 std::vector<uint32_t> second_chance_oldfreq;
+
+RuntimeTopology g_runtime_topology;
+CgroupRuntimeContext g_cgroup_runtime_context;
+pid_t g_perf_target_pid = 0;
+std::vector<int> g_monitored_cpus;
+
+uint64_t effective_memcg_high_wmark_pages(const MemcgNodeBudget& budget) {
+  if (budget.high_wmark_pages > 0) {
+    return budget.high_wmark_pages;
+  }
+  return budget.capacity_pages;
+}
 
 
 struct perf_sample {
   struct perf_event_header header;
+  __u32 pid;
+  __u32 tid;
   __u64 addr;        /* if PERF_SAMPLE_ADDR */
 };
 
@@ -119,8 +134,9 @@ int64_t m_from_knp(int64_t k, int64_t n, float p) {
 // The current memory range (start_address to end_address) might not have num_pages_to_demote
 // cold pages. In that case, the return value indicates how many cold pages were detected.
 uint64_t handle_virtual_range(int pagemap_fd, uint64_t start_address, uint64_t end_address, 
-                              frequency_sketch<uint64_t> &lfu, frequency_sketch<uint64_t> &momentum, 
-                              int hot_thresh, std::vector<uint64_t> &cold_page_list, 
+                              int owner_pid,
+                              frequency_sketch<PageKey> &lfu, frequency_sketch<PageKey> &momentum, 
+                              int hot_thresh, std::vector<PageKey> &cold_page_list, 
                               uint64_t num_pages_to_demote, uint64_t *last_scanned_address) {
 
   //printf("pagemap addr 0x%-16lx - 0x%-16lx \n", start_address, end_address);
@@ -165,11 +181,16 @@ uint64_t handle_virtual_range(int pagemap_fd, uint64_t start_address, uint64_t e
     for(uint64_t ii = 0; ii < pagemap_read_bytes/sizeof(uint64_t); ii++) {
       uint64_t virtual_page_addr = curr_address + ii*PAGE_SIZE; // start from the first page in the 1024 chunk
       uint64_t pfn = pagemap_buffer[ii] & 0x7fffffffffffff;
+      uint64_t aligned_addr = virtual_page_addr & ~(0x1FFFFF);
+      bool is_fast_tier_page = (pfn > 0 && g_runtime_topology.fast_tier_contains_pfn(pfn));
+      if (!is_fast_tier_page && !g_runtime_topology.fast_tier_has_pfn_ranges()) {
+        is_fast_tier_page = (get_page_current_node(owner_pid, aligned_addr) == g_runtime_topology.fast_node);
+      }
       //printf("vaddr %lx pfn %lx \n", virtual_page_addr, pfn);
-      if (pfn > 0 && pfn < 0x8080000) {
-        // This virtual page is mapped to a physical page on node 0 (fast tier memory)
-        int page_freq = lfu.frequency(virtual_page_addr & ~(0x1FFFFF));
-        int page_momentum = momentum.frequency(virtual_page_addr & ~(0x1FFFFF));
+      if (is_fast_tier_page) {
+        PageKey page_key = make_page_key(owner_pid, aligned_addr);
+        int page_freq = lfu.frequency(page_key);
+        int page_momentum = momentum.frequency(page_key);
         // 4 cases for demotion:
         // low frequency + low momentum -> demote
         // low frequency + high momentum -> do not demote
@@ -178,18 +199,18 @@ uint64_t handle_virtual_range(int pagemap_fd, uint64_t start_address, uint64_t e
         //printf("demote fast tier page?  vaddr %lx, freq %d, momentum %d \n", virtual_page_addr, page_freq, page_momentum);
         if (page_freq < hot_thresh && page_momentum < 400) { 
           // low frequency + low momentum case
-          cold_page_list.push_back(virtual_page_addr);
+          cold_page_list.push_back(page_key);
           num_cold_pages_found++;
           //printf("demote \n");
         } else if (page_freq >= hot_thresh && page_momentum < 20) {
           //printf("[2ndc]   in demotion, found second chance page %lx, page_freq %d\n", virtual_page_addr&~(0xFFF), page_freq);
           // high frequency + low momentum case. 
           if (second_chance_queue.size() < 1000) { // limit second chance demotion
-            second_chance_queue.push_back(virtual_page_addr & ~(0x1FFFFF));
+            second_chance_queue.push_back(page_key);
             if (page_freq == 65535) {
               // If page already has frequency 15, decrement its frequency by 1. This is used to check 
               // if any accesses will occur to this page (second chance)
-              lfu.decrement_frequency(virtual_page_addr & ~(0x1FFFFF));
+              lfu.decrement_frequency(page_key);
               second_chance_oldfreq.push_back(65534);
             } else {
               // Record current frequency. 
@@ -217,10 +238,51 @@ uint64_t handle_virtual_range(int pagemap_fd, uint64_t start_address, uint64_t e
 
 }
 
+uint64_t move_page_keys_to_node(const std::vector<PageKey> &page_keys, int target_node) {
+  std::unordered_map<pid_t, std::vector<uint64_t>> pages_by_pid;
+  for (const PageKey &page_key : page_keys) {
+    pages_by_pid[static_cast<pid_t>(page_key.pid)].push_back(page_key.addr);
+  }
+
+  uint64_t moved_pages = 0;
+  for (const auto &pages_for_pid : pages_by_pid) {
+    pid_t owner_pid = pages_for_pid.first;
+    const std::vector<uint64_t> &addresses = pages_for_pid.second;
+    if (owner_pid <= 0 || addresses.empty()) {
+      continue;
+    }
+
+    std::vector<void*> move_pages_args(addresses.size());
+    std::vector<int> target_nodes(addresses.size(), target_node);
+    std::vector<int> status(addresses.size(), 99);
+    for (size_t index = 0; index < addresses.size(); ++index) {
+      move_pages_args[index] = reinterpret_cast<void*>(addresses[index]);
+    }
+
+    long move_ret = numa_move_pages(owner_pid,
+                                    addresses.size(),
+                                    move_pages_args.data(),
+                                    target_nodes.data(),
+                                    status.data(),
+                                    MPOL_MF_MOVE_ALL);
+    if (move_ret == 0) {
+      moved_pages += addresses.size();
+      continue;
+    }
+
+    std::cerr << "[WARN] numa_move_pages failed for pid " << owner_pid
+              << " errno=" << errno << std::endl;
+  }
+  return moved_pages;
+}
+
 void close_perf(){
   std::cout << "closing perf counters" << std::endl;
-  for (int i = 0; i < NPROC; i++) {
+  for (size_t i = 0; i < fd.size(); i++) {
     for (int j = 0; j < NPBUFTYPES; j++) {
+       if (fd[i][j] < 0 || perf_page[i][j] == nullptr) {
+           continue;
+       }
        // disable the event
        if (ioctl(fd[i][j], PERF_EVENT_IOC_DISABLE, 0) == -1) {
            perror("ioctl(PERF_EVENT_IOC_DISABLE)");
@@ -234,6 +296,8 @@ void close_perf(){
        if (close(fd[i][j]) == -1) {
            perror("close fd");
        }
+       fd[i][j] = -1;
+       perf_page[i][j] = nullptr;
        std::cout << "close fd done " << j << std::endl;
     }
   }
@@ -270,8 +334,20 @@ perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
     return ret;
 }
 
+void initialize_perf_state(const std::vector<int>& monitored_cpus) {
+  g_monitored_cpus = monitored_cpus;
+  fd.assign(g_monitored_cpus.size(), std::array<int, NPBUFTYPES>{});
+  perf_page.assign(g_monitored_cpus.size(), std::array<struct perf_event_mmap_page*, NPBUFTYPES>{});
+  for (size_t i = 0; i < g_monitored_cpus.size(); ++i) {
+    for (int j = 0; j < NPBUFTYPES; ++j) {
+      fd[i][j] = -1;
+      perf_page[i][j] = nullptr;
+    }
+  }
+}
+
  
-struct perf_event_mmap_page* perf_setup_one_event(__u64 config, __u64 cpu, __u64 type, __u64 perf_sample_freq) {
+struct perf_event_mmap_page* perf_setup_one_event(__u64 config, size_t cpu_slot, __u64 cpu, __u64 type, __u64 perf_sample_freq) {
     struct perf_event_attr pe;
     memset(&pe, 0, sizeof(pe));
 
@@ -282,7 +358,7 @@ struct perf_event_mmap_page* perf_setup_one_event(__u64 config, __u64 cpu, __u64
     pe.size = sizeof(pe);
     pe.config = config;
     //pe.sample_period = 20;
-    pe.sample_type = PERF_SAMPLE_ADDR;
+    pe.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_ADDR;
     //pe.disabled = 0;
     pe.disabled = 1;
     //pe.freq = 0;
@@ -302,8 +378,10 @@ struct perf_event_mmap_page* perf_setup_one_event(__u64 config, __u64 cpu, __u64
     // returns a file descriptor, for use in subsequent system calls.
     // For some reason I cannot configure the perf event to sample from all CPUs.
     //fd = perf_event_open(&pe, 0, -1, -1, 0);
-    fd[cpu][type] = perf_event_open(&pe, -1, cpu, -1, 0);
-    if (fd[cpu][type] == -1) {
+    pid_t perf_pid = g_cgroup_runtime_context.enabled ? g_cgroup_runtime_context.cgroup_fd : g_perf_target_pid;
+    unsigned long perf_flags = g_cgroup_runtime_context.enabled ? PERF_FLAG_PID_CGROUP : 0;
+    fd[cpu_slot][type] = perf_event_open(&pe, perf_pid, cpu, -1, perf_flags);
+    if (fd[cpu_slot][type] == -1) {
        std::perror("failed");
        fprintf(stderr, "Error opening leader %llx\n", pe.config);
        exit(EXIT_FAILURE);
@@ -317,7 +395,7 @@ struct perf_event_mmap_page* perf_setup_one_event(__u64 config, __u64 cpu, __u64
     // flags: whether updates to the mapping are visible to other processes mapping the same region.
     // fd: file descriptor.
     // offset: offset into the file.
-    struct perf_event_mmap_page *p = (perf_event_mmap_page *)mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd[cpu][type], 0);
+    struct perf_event_mmap_page *p = (perf_event_mmap_page *)mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd[cpu_slot][type], 0);
 
     if(p == MAP_FAILED) {
       perror("mmap");
@@ -334,7 +412,7 @@ struct perf_event_mmap_page* perf_setup_one_event(__u64 config, __u64 cpu, __u64
     //}
 
     // Enable the event
-    if (ioctl(fd[cpu][type], PERF_EVENT_IOC_ENABLE, 0) == -1) {
+    if (ioctl(fd[cpu_slot][type], PERF_EVENT_IOC_ENABLE, 0) == -1) {
       perror("ioctl(PERF_EVENT_IOC_ENABLE)");
       exit(EXIT_FAILURE);
     }
@@ -343,15 +421,18 @@ struct perf_event_mmap_page* perf_setup_one_event(__u64 config, __u64 cpu, __u64
 
 
 void perf_setup(__u64 perf_sample_freq) {
-  for (int i = 0; i < NPROC; i++) {
-    perf_page[i][LOCAL_DRAM_LOAD]  = perf_setup_one_event(0x1d3, i, LOCAL_DRAM_LOAD, perf_sample_freq); // MEM_LOAD_L3_MISS_RETIRED.LOCAL_DRAM
-    perf_page[i][REMOTE_DRAM_LOAD] = perf_setup_one_event(0x2d3, i, REMOTE_DRAM_LOAD, perf_sample_freq); // MEM_LOAD_L3_MISS_RETIRED.REMOTE_DRAM
+  for (size_t i = 0; i < g_monitored_cpus.size(); i++) {
+    perf_page[i][LOCAL_DRAM_LOAD]  = perf_setup_one_event(0x1d3, i, g_monitored_cpus[i], LOCAL_DRAM_LOAD, perf_sample_freq); // MEM_LOAD_L3_MISS_RETIRED.LOCAL_DRAM
+    perf_page[i][REMOTE_DRAM_LOAD] = perf_setup_one_event(0x2d3, i, g_monitored_cpus[i], REMOTE_DRAM_LOAD, perf_sample_freq); // MEM_LOAD_L3_MISS_RETIRED.REMOTE_DRAM
   }
 }
 
 
 void close_perf_one_counter(int i, int j){
   std::cout << "closing perf counter " << i << ", " << j << std::endl;
+  if (fd[i][j] < 0 || perf_page[i][j] == nullptr) {
+      return;
+  }
   if (ioctl(fd[i][j], PERF_EVENT_IOC_DISABLE, 0) == -1) {
       perror("ioctl(PERF_EVENT_IOC_DISABLE)");
   }
@@ -361,18 +442,24 @@ void close_perf_one_counter(int i, int j){
   if (close(fd[i][j]) == -1) {
       perror("close fd");
   }
+  fd[i][j] = -1;
+  perf_page[i][j] = nullptr;
 }
 
 void change_perf_freq(int i, int j, __u64 new_sample_freq) {
   close_perf_one_counter(i, j);
   if (j == LOCAL_DRAM_LOAD) {
-    perf_page[i][j] = perf_setup_one_event(0x1d3, i, LOCAL_DRAM_LOAD, new_sample_freq);
+    perf_page[i][j] = perf_setup_one_event(0x1d3, i, g_monitored_cpus[i], LOCAL_DRAM_LOAD, new_sample_freq);
   } else if (j == REMOTE_DRAM_LOAD) {
-    perf_page[i][j] = perf_setup_one_event(0x2d3, i, REMOTE_DRAM_LOAD, new_sample_freq); // MEM_LOAD_L3_MISS_RETIRED.LOCAL_DRAM
+    perf_page[i][j] = perf_setup_one_event(0x2d3, i, g_monitored_cpus[i], REMOTE_DRAM_LOAD, new_sample_freq); // MEM_LOAD_L3_MISS_RETIRED.LOCAL_DRAM
   }
 }
 
 void start_perf_stat() {
+  if (g_cgroup_runtime_context.enabled) {
+    std::cout << "[INFO] Skipping global perf stat monitor in cgroup-scoped mode." << std::endl;
+    return;
+  }
   std::cout << "[INFO] 2Starting perf stat monitoring." << std::endl;
   // I am using the perf executable instead of perf_event_open to monitor hardware counters
   // because there is no need to use perf_event_open, since the performance overhead of using the perf executable 
@@ -534,27 +621,16 @@ uint32_t check_fast_mem_hit_ratio(int cur_sampling_freq) {
   return next_sampling_freq(cur_sampling_freq , false);
 }
 
-// Returns amount of free memory in node 0 in KB
-uint64_t get_node0_free_mem() {
-  std::string path = "/sys/devices/system/node/node0/meminfo";
-  std::ifstream file(path);
-  if (!file) {
-      std::cerr << "Failed to open " << path << std::endl;
-      return -1;
-  }
-  std::string line;
-  std::regex regex(R"(MemFree:\s+(\d+) kB)");
-  while (getline(file, line)) {
-      std::smatch match;
-      if (std::regex_search(line, match, regex)) {
-          return std::stoull(match[1].str());
-      }
-  }
-  return -1;
+uint64_t get_node_free_mem(int node_id) {
+  return read_node_meminfo_value_kb(node_id, "MemFree:");
 }
 
 
 void low_overhead_monitor() {
+  if (g_cgroup_runtime_context.enabled) {
+    std::cout << "[INFO] Skipping perf-stat monitor path in cgroup-scoped mode." << std::endl;
+    return;
+  }
   std::cout << "[INFO] Starting low overhead perf stat monitoring." << std::endl;
   close_perf();
   std::cout << "[INFO] Sleep for 120s for fast memory hit ratio to stablize." << std::endl;
@@ -575,12 +651,14 @@ void low_overhead_monitor() {
     sleep(12); // Check periodically
     
     // If local memory has lots of free memory, resume tiering
-    uint64_t node0_free_mem_kB = get_node0_free_mem(); // in kB
-    std::cout << "[INFO] node 0 free memory in kB : " << node0_free_mem_kB << std::endl;
-    if (node0_free_mem_kB*1000 >= DEMOTE_WMARK * 2) {
+    uint64_t fast_node_free_mem_kB = get_node_free_mem(g_runtime_topology.fast_node); // in kB
+    std::cout << "[INFO] fast node " << g_runtime_topology.fast_node
+              << " free memory in kB : " << fast_node_free_mem_kB << std::endl;
+    if (fast_node_free_mem_kB*1000 >= DEMOTE_WMARK * 2) {
       num_times_too_much_free_memory++;
       if (num_times_too_much_free_memory > 20) {
-        std::cout << "[INFO] Too much free memory for 20 times consecutively. Resume tiering: " << node0_free_mem_kB << std::endl;
+        std::cout << "[INFO] Too much free memory for 20 times consecutively. Resume tiering: "
+                  << fast_node_free_mem_kB << std::endl;
         return;
       }
     } else {
@@ -596,7 +674,7 @@ void low_overhead_monitor() {
 // full_sweep_not_enough_cold_pages: indicates whether we have performed a full sweep of the address space 
 // Return value: actual number of pages demoted. 
 uint64_t scan_for_cold_pages(int pid, int hot_thresh, 
-                             frequency_sketch<uint64_t> &lfu, frequency_sketch<uint64_t> &momentum, 
+                             frequency_sketch<PageKey> &lfu, frequency_sketch<PageKey> &momentum, 
                              uint64_t num_pages_to_demote_requested, uint64_t *last_scanned_address,
                              bool *full_sweep_not_enough_cold_pages) {
   std::cout << "scan_for_cold_pages" << std::endl;
@@ -609,7 +687,7 @@ uint64_t scan_for_cold_pages(int pid, int hot_thresh,
   uint64_t start_addr;
   uint64_t end_addr;
   uint64_t vma_num_pages;
-  std::vector<uint64_t> cold_page_list;
+  std::vector<PageKey> cold_page_list;
   uint64_t num_cold_pages_found = 0;
 
   uint32_t maps_num_lines = 0;
@@ -669,9 +747,11 @@ uint64_t scan_for_cold_pages(int pid, int hot_thresh,
       return -1;
     }
     num_cold_pages_found += handle_virtual_range(pagemap_fd, start_addr, end_addr, 
+                                                 pid,
                                                  lfu, momentum, 
                                                  hot_thresh, cold_page_list, 
                                                  num_pages_to_demote_requested - num_cold_pages_found, last_scanned_address);
+    close(pagemap_fd);
 
     std::cout << "  found cold pages: " << num_cold_pages_found << ", last scanned " << std::hex << *last_scanned_address << std::dec  << std::endl;
     if (num_cold_pages_found >= num_pages_to_demote_requested) {
@@ -688,10 +768,10 @@ uint64_t scan_for_cold_pages(int pid, int hot_thresh,
   if (num_cold_pages_found >= num_pages_to_demote_requested) {
     std::cout << "found " << num_cold_pages_found << " cold pages. requested " << num_pages_to_demote_requested << std::endl;
   } else {
-    std::cout << "did not find " << num_pages_to_demote_requested << " cold pages in node 0" << std::endl;
+    std::cout << "did not find " << num_pages_to_demote_requested << " cold pages in fast tier node" << std::endl;
     if (maps_cur_line == maps_num_lines) {
       // Sweeped through the entire address space in /proc/pid/maps and did not find enough pages to demote
-      std::cout << "Did not find " << num_pages_to_demote_requested << " cold pages in node 0 after a full address space sweep" << std::endl;
+      std::cout << "Did not find " << num_pages_to_demote_requested << " cold pages in fast tier after a full address space sweep" << std::endl;
       *full_sweep_not_enough_cold_pages = true;
     }
   
@@ -702,22 +782,10 @@ uint64_t scan_for_cold_pages(int pid, int hot_thresh,
   // TODO: check below. 
   //uint32_t num_pages_to_demote_actual = std::max(num_pages_to_demote_requested, num_cold_pages_found);
   uint64_t num_pages_to_demote_actual = cold_page_list.size();
-  int** demote_pages = new int*[num_pages_to_demote_actual];
-  int* demote_nodes = new int[num_pages_to_demote_actual];
-  int* demote_status = new int[num_pages_to_demote_actual];
-  int demote_ret; 
-
-  for (uint64_t i = 0; i < num_pages_to_demote_actual; i++) {
-    demote_pages[i] = (int*)(cold_page_list[i]);
-    demote_nodes[i] = 1; // Demote to node 1
-    demote_status[i] = 99;
-  }
-
-  demote_ret = numa_move_pages(0, num_pages_to_demote_actual, (void **)demote_pages, demote_nodes, demote_status, MPOL_MF_MOVE_ALL);
-
-  delete[] demote_pages;
-  delete[] demote_nodes;
-  delete[] demote_status;
+  int demote_ret =
+      (move_page_keys_to_node(cold_page_list, g_runtime_topology.first_slow_node()) == num_pages_to_demote_actual)
+          ? 0
+          : -1;
 
   std::cout << "scan_for_cold_pages done" << std::endl;
   if (demote_ret == 0) {
@@ -728,22 +796,81 @@ uint64_t scan_for_cold_pages(int pid, int hot_thresh,
   return -1;
 }
 
+struct DemotionScanResult {
+  uint64_t pages_demoted = 0;
+  bool full_sweep_not_enough_cold_pages = false;
+};
 
+DemotionScanResult scan_managed_pids_for_cold_pages(const std::vector<pid_t> &managed_pids,
+                                                    int hot_thresh,
+                                                    frequency_sketch<PageKey> &lfu,
+                                                    frequency_sketch<PageKey> &momentum,
+                                                    uint64_t num_pages_to_demote_requested,
+                                                    std::unordered_map<pid_t, uint64_t> &last_scanned_address_by_pid) {
+  DemotionScanResult result;
+  if (managed_pids.empty()) {
+    return result;
+  }
 
-std::vector<void*> check_pages_on_node(const std::vector<void*>& addresses, size_t pages, int check_node) {
-    std::vector<int> status(pages, -1);  // Status to hold the current node
-    std::vector<void*> pages_to_move;
-
-    // Call numa_move_pages with the NULL target node to only check status
-    int err = numa_move_pages(0, pages, const_cast<void**>(addresses.data()), nullptr, status.data(), 0);
-    if (err != 0) {
-        std::cerr << "numa_move_pages() failed during status check: " << strerror(errno) << std::endl;
-        exit(EXIT_FAILURE);
+  bool full_sweep_everywhere = true;
+  for (pid_t managed_pid : managed_pids) {
+    if (managed_pid <= 0) {
+      continue;
     }
 
-    // Collect pages that are currently on the specified check_node
+    uint64_t &last_scanned_address = last_scanned_address_by_pid[managed_pid];
+    bool pid_full_sweep_not_enough_cold_pages = false;
+    uint64_t pages_demoted = scan_for_cold_pages(managed_pid,
+                                                 hot_thresh,
+                                                 lfu,
+                                                 momentum,
+                                                 num_pages_to_demote_requested - result.pages_demoted,
+                                                 &last_scanned_address,
+                                                 &pid_full_sweep_not_enough_cold_pages);
+    if (pages_demoted != static_cast<uint64_t>(-1)) {
+      result.pages_demoted += pages_demoted;
+    }
+
+    if (!pid_full_sweep_not_enough_cold_pages) {
+      full_sweep_everywhere = false;
+    } else {
+      last_scanned_address = 0;
+    }
+
+    if (result.pages_demoted >= num_pages_to_demote_requested) {
+      result.full_sweep_not_enough_cold_pages = false;
+      return result;
+    }
+  }
+
+  result.full_sweep_not_enough_cold_pages =
+      (result.pages_demoted < num_pages_to_demote_requested) && full_sweep_everywhere;
+  return result;
+}
+
+
+
+std::vector<uint64_t> collect_promotable_pages(pid_t owner_pid,
+                                               const std::vector<uint64_t>& addresses) {
+    size_t pages = addresses.size();
+    std::vector<int> status(pages, -1);  // Status to hold the current node
+    std::vector<void*> address_ptrs(pages);
+    std::vector<uint64_t> pages_to_move;
     for (size_t i = 0; i < pages; ++i) {
-        if (status[i] == check_node) {
+        address_ptrs[i] = reinterpret_cast<void*>(addresses[i]);
+    }
+
+    // Call numa_move_pages with the NULL target node to only check status
+    int err = numa_move_pages(owner_pid, pages, address_ptrs.data(), nullptr, status.data(), 0);
+    if (err != 0) {
+        std::cerr << "numa_move_pages() failed during status check: " << strerror(errno) << std::endl;
+        return pages_to_move;
+    }
+
+    // Collect pages that are on any slow tier we currently manage.
+    for (size_t i = 0; i < pages; ++i) {
+        if (status[i] != g_runtime_topology.fast_node &&
+            g_runtime_topology.contains_node(status[i])) {
             pages_to_move.push_back(addresses[i]);
         }
     }
@@ -754,18 +881,86 @@ std::vector<void*> check_pages_on_node(const std::vector<void*>& addresses, size
 
 void* perf_func(void*) {
     std::cout << "Hybridtier. huge page" << std::endl;
-    uint64_t fast_memory_size = FAST_MEMORY_SIZE;
+    g_cgroup_runtime_context = init_cgroup_runtime_context();
+    if (g_cgroup_runtime_context.enabled && !g_cgroup_runtime_context.leader) {
+      std::cout << "[INFO] Another process already manages cgroup "
+                << g_cgroup_runtime_context.cgroup_relative_path
+                << ". Skipping duplicate tiering thread." << std::endl;
+      return NULL;
+    }
+
+    g_runtime_topology = detect_runtime_topology();
+    if (g_cgroup_runtime_context.enabled) {
+      g_runtime_topology = filter_topology_by_allowed_mems(g_runtime_topology,
+                                                           g_cgroup_runtime_context.allowed_mems);
+    }
+    if (g_runtime_topology.tiers.empty()) {
+      std::cout << "ERROR no eligible NUMA tiers detected." << std::endl;
+      return NULL;
+    }
+    if (g_runtime_topology.first_slow_node() < 0) {
+      std::cout << "ERROR no slow tier node detected for runtime topology." << std::endl;
+      return NULL;
+    }
+    initialize_perf_state(detect_monitored_cpus(g_cgroup_runtime_context));
+    if (g_monitored_cpus.empty()) {
+      std::cout << "ERROR no eligible CPUs detected for perf monitoring." << std::endl;
+      return NULL;
+    }
+
+    const uint64_t memcg_accounting_page_size = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+    bool fast_memory_size_from_memcg = false;
+    MemcgNodeBudget memcg_fast_node_budget;
+    uint64_t fast_memory_size = resolve_fast_memory_size_bytes(FAST_MEMORY_SIZE,
+                                                               g_cgroup_runtime_context,
+                                                               g_runtime_topology.fast_node,
+                                                               memcg_accounting_page_size,
+                                                               &fast_memory_size_from_memcg,
+                                                               &memcg_fast_node_budget);
     if (fast_memory_size == 0) {
       std::cout << "ERROR fast tier memory size not provided."  << std::endl;
       exit(1);
     }
+    FAST_MEMORY_SIZE = fast_memory_size;
+    NUM_FAST_MEMORY_PAGES = FAST_MEMORY_SIZE/PAGE_SIZE;
+    SAMPLE_SIZE = NUM_FAST_MEMORY_PAGES*16*10*400;
     std::cout << "[DEBUG] fast memory size = " << fast_memory_size  << std::endl;
     std::cout << "[DEBUG] number of pages in fast memory = " << NUM_FAST_MEMORY_PAGES << std::endl;
     std::cout << "[DEBUG] perf_pages = " << NUM_FAST_MEMORY_PAGES << std::endl;
     printf(" perf_pages %d, sample_batch_size %d \n", PERF_PAGES, SAMPLE_BATCH_SIZE);
 
     pid_t pid = getpid();
+    g_perf_target_pid = pid;
     std::cout << "pid: " << pid << std::endl;
+    std::cout << "[INFO] Fast tier node is " << g_runtime_topology.fast_node
+              << ", primary slow tier node is " << g_runtime_topology.first_slow_node() << std::endl;
+    if (const TierDesc* fast_tier = g_runtime_topology.tier_for_node(g_runtime_topology.fast_node)) {
+      std::cout << "[INFO] Fast tier PFN range segments: " << fast_tier->pfn_ranges.size() << std::endl;
+    }
+    std::cout << "[INFO] Monitoring " << g_monitored_cpus.size() << " CPUs for perf sampling." << std::endl;
+    if (g_cgroup_runtime_context.enabled) {
+      std::cout << "[INFO] Cgroup-scoped runtime enabled for "
+                << g_cgroup_runtime_context.cgroup_relative_path
+                << ", memory.current=" << g_cgroup_runtime_context.memory_current_bytes
+                << " bytes" << std::endl;
+      if (fast_memory_size_from_memcg) {
+        std::cout << "[INFO] Using cgroup memory.node_capacity for fast-node budget: node "
+                  << g_runtime_topology.fast_node
+                  << ", capacity=" << memcg_fast_node_budget.capacity_pages
+                  << " pages, low=" << memcg_fast_node_budget.low_wmark_pages
+                  << " pages, high=" << memcg_fast_node_budget.high_wmark_pages
+                  << " pages" << std::endl;
+      } else if (g_cgroup_runtime_context.memcg_node_budget_supported) {
+        std::cout << "[INFO] memory.node_capacity is available but not configured for fast node "
+                  << g_runtime_topology.fast_node
+                  << ". Falling back to FAST_MEMORY_SIZE_GB." << std::endl;
+      } else {
+        std::cout << "[INFO] memory.node_capacity is not available in this kernel/cgroup. "
+                  << "Falling back to FAST_MEMORY_SIZE_GB." << std::endl;
+      }
+    } else {
+      std::cout << "[INFO] Falling back to process-scoped runtime." << std::endl;
+    }
   
     uint64_t unknown_cnt = 0;
     uint64_t sample_cnt = 0;
@@ -789,8 +984,8 @@ void* perf_func(void*) {
     #endif
     
     assert(NUM_CBF_ENTRIES >= 0);
-    frequency_sketch<uint64_t> lfu(NUM_CBF_ENTRIES, SAMPLE_SIZE);
-    frequency_sketch<uint64_t> momentum(NUM_CBF_ENTRIES/8, 1100000);
+    frequency_sketch<PageKey> lfu(NUM_CBF_ENTRIES, SAMPLE_SIZE);
+    frequency_sketch<PageKey> momentum(NUM_CBF_ENTRIES/8, 1100000);
     std::cout << std::dec << "Starting hot threshold = " << hot_thresh << std::endl;
     std::cout << std::dec << "Momentum threshold = " << momentum_thresh << std::endl;
     std::cout << std::dec << "Stable fast mem hit ratio slope threshold = " << SLOPE_THRESH << std::endl;
@@ -804,17 +999,6 @@ void* perf_func(void*) {
     uint64_t page_addr;
     uint64_t num_local_mem_samples_in_batch = 0;
     uint64_t num_remote_mem_samples_in_batch = 0;
-    uint64_t num_local_mem_samples_hot = 0;
-    uint64_t num_pages_lfu_demote = 0;
-
-    // Used for move_pages() syscall.
-    // Migrate in batches (PAGE_MIGRATE_BATCH_SIZE pages)
-    std::vector<void*> migrate_pages(SAMPLE_BATCH_SIZE);
-    std::vector<int> migrate_status(SAMPLE_BATCH_SIZE, 99);
-    std::vector<int> migrate_nodes(SAMPLE_BATCH_SIZE, 0);
-
-    int cur_page_in_migration_batch = 0; // track how many pages we have collected. migrate the batch when this reaches 100.
-
     uint64_t pages_migrated = 0;
     uint64_t move_pages_errors = 0;
     //long prev_pages_migrated = 0;
@@ -823,12 +1007,12 @@ void* perf_func(void*) {
     //bool migration_done = false;
 
     //std::vector<vma_range> demotion_vma_scanned;
-    uint64_t last_scanned_address = 0;
     __u64 perf_sample_freq = perf_sample_freq_list[4];
     __u64 perf_sample_freq_local = perf_sample_freq;
     
-    std::unordered_map<uint64_t, uint32_t> sampled_address_counts[NPBUFTYPES]; // one for fast tier, one for slow tier
+    std::unordered_map<PageKey, uint32_t, PageKeyHash> sampled_address_counts[NPBUFTYPES]; // one for fast tier, one for slow tier
     uint64_t num_samples_collected_in_batch = 0;
+    std::unordered_map<pid_t, uint64_t> last_scanned_address_by_pid;
 
     // Have we already performed a full demotion sweep and did not find enough cold pages?
     // If two consecutive full demotion sweep does not give enough memory, go into monitor mode
@@ -862,10 +1046,9 @@ void* perf_func(void*) {
 
 perf_sampling_start:
     sample_cnt = 0;
-    cur_page_in_migration_batch = 0;
     perf_setup(perf_sample_freq);
     for(;;){
-      for (int i = 0; i < NPROC; i++) {
+      for (size_t i = 0; i < g_monitored_cpus.size(); i++) {
         for(int j = 0; j < NPBUFTYPES; j++) {
           struct perf_event_mmap_page *p = perf_page[i][j];
           char *pbuf = (char *)p + p->data_offset;
@@ -896,6 +1079,7 @@ perf_sampling_start:
                   ps = (struct perf_sample*)ph;
                   if (ps->addr != 0) { // sometimes the sample address is 0. Not sure why
                     page_addr = ps->addr & ~(0x1FFFFF); // get virtual page address from address
+                    PageKey sample_key = make_page_key(ps->pid == 0 ? pid : ps->pid, page_addr);
                     
                     sample_cnt = sample_cnt + 1;
                     
@@ -905,7 +1089,7 @@ perf_sampling_start:
                       num_local_mem_samples_in_batch++;
                     }
 
-                    sampled_address_counts[j][page_addr]++;
+                    sampled_address_counts[j][sample_key]++;
 
                     num_samples_collected_in_batch++;
                     if (num_samples_collected_in_batch < SAMPLE_BATCH_SIZE) {
@@ -916,29 +1100,25 @@ perf_sampling_start:
                     //printf("total samples fast %d, slow %d \n", num_local_mem_samples_in_batch, num_remote_mem_samples_in_batch);
 
                     num_samples_collected_in_batch = 0;
-                    uint64_t num_pages_to_migrate = 0;
+                    std::unordered_map<pid_t, std::vector<uint64_t>> promote_candidates_by_pid;
 
-                    
                     // Process batch of samples once total of SAMPLE_BATCH_SIZE samples has been collected (from both local and remote)
                     for(int jj = 0; jj < NPBUFTYPES; jj++) {
                       // go through each address sampled from fast tier and slow tier
                       for (const auto& sample_address_count_pair : sampled_address_counts[jj]) {
-                        uint64_t sampled_addr = sample_address_count_pair.first;
+                        PageKey sampled_key = sample_address_count_pair.first;
                         uint32_t sampled_addr_count = sample_address_count_pair.second;
                         uint32_t updated_freq;
                         uint32_t updated_momentum;
                         // increase the frequency of sampled_addr to sampled_addr_count
-                        lfu.increase_frequency(sampled_addr, sampled_addr_count, &updated_freq); 
-                        momentum.increase_frequency(sampled_addr, sampled_addr_count, &updated_momentum); 
-                        //printf("page %lx, freq %d, momentum %d \n", sampled_addr, lfu.frequency(sampled_addr), momentum.frequency(sampled_addr));
+                        lfu.increase_frequency(sampled_key, sampled_addr_count, &updated_freq); 
+                        momentum.increase_frequency(sampled_key, sampled_addr_count, &updated_momentum); 
 
                         // Seems like PEBS is not accurate in terms of which node a page is from.
                         // Try to promote pages sampled from both LOCAL_DRAM and REMOTE_DRAM.
-                        if (updated_freq >= hot_thresh || updated_momentum >= momentum_thresh) {
-                        //if (updated_freq >= hot_thresh) {
-                          migrate_pages[num_pages_to_migrate] = (int*)sampled_addr;
-                          migrate_status[num_pages_to_migrate] = 99;
-                          num_pages_to_migrate++;
+                        if (updated_freq >= static_cast<uint32_t>(hot_thresh) ||
+                            updated_momentum >= static_cast<uint32_t>(momentum_thresh)) {
+                          promote_candidates_by_pid[static_cast<pid_t>(sampled_key.pid)].push_back(sampled_key.addr);
                         }
                       }
                       // Reset hash tables
@@ -948,8 +1128,6 @@ perf_sampling_start:
                       num_unuseful_samples[jj] = lfu.get_num_nonuseful_samples();
                       lfu.clear_num_nonuseful_samples(); // reset nonuseful counter
                     }
-
-                    printf("collected one batch of samples. pages to migrate = %ld \n", num_pages_to_migrate);
 
                     unuseful_sample_fraction_local = (float) (num_unuseful_samples[LOCAL_DRAM_LOAD]) / num_local_mem_samples_in_batch;
                     unuseful_sample_fraction_remote = (float) (num_unuseful_samples[REMOTE_DRAM_LOAD]) / num_remote_mem_samples_in_batch;
@@ -964,198 +1142,258 @@ perf_sampling_start:
                     num_local_mem_samples_in_batch = 0;
                     num_remote_mem_samples_in_batch = 0;
 
-
-                    std::vector<void*> pages_on_node_1 = check_pages_on_node(migrate_pages, num_pages_to_migrate, 1);
-                    size_t num_pages_in_slow = pages_on_node_1.size();
-                    size_t num_pages_in_fast = num_pages_to_migrate - num_pages_in_slow;
-
-
-
-                    //delete[] dbg_status;
-                    if (num_pages_in_slow == 0) {
-                      printf("no slow pages to promote\n");
-                    }
-                    
-                    if (num_pages_in_slow > 0) {
-                      printf("start promoting %ld pages\n", num_pages_in_slow);
-                      // Migrate the batch of pages
-                      //move_page_ret = numa_move_pages(0, num_pages_to_migrate, (void **)migrate_pages, migrate_nodes, migrate_status, MPOL_MF_MOVE_ALL);
-                      move_page_ret = numa_move_pages(0, num_pages_in_slow, const_cast<void**>(pages_on_node_1.data()), migrate_nodes.data(), migrate_status.data(), MPOL_MF_MOVE_ALL);
-                      if (move_page_ret == 0) { 
-                        // Number of pages actually promoted
-                        //pages_migrated += num_pages_in_slow - num_pages_remain_in_slow; 
-                        pages_migrated += num_pages_in_slow;
-                        num_pages_promoted_history += num_pages_in_slow;
-
-                      } else {
-                        printf("move page ret %d \n", move_page_ret);
-                        std::cout << "move page error: " << errno << '\n';
-
-                        if (errno == ENOMEM) {
-                          printf("got ENOMEM. trying against with %ld pages \n", num_pages_in_slow/5);
-                          // Fast tier does not have enough memory for migration. 
-                          // Try again with 1/4 of pages.
-                          move_page_ret = numa_move_pages(0, num_pages_to_migrate/10, const_cast<void**>(pages_on_node_1.data()), migrate_nodes.data(), migrate_status.data(), MPOL_MF_MOVE_ALL);
-                          
-                          printf("second promote attempt return %d\n", move_page_ret);
+                    MemcgNodeBudget batch_memcg_budget =
+                        read_cgroup_memcg_node_budget(g_cgroup_runtime_context,
+                                                      g_runtime_topology.fast_node);
+                    MemcgNodeRuntimeState batch_memcg_state =
+                        read_cgroup_memcg_node_runtime_state(g_cgroup_runtime_context,
+                                                             g_runtime_topology.fast_node,
+                                                             memcg_accounting_page_size);
+                    bool enforce_memcg_promotion_budget = false;
+                    uint64_t promotion_headroom_pages = std::numeric_limits<uint64_t>::max();
+                    if (batch_memcg_budget.configured && batch_memcg_state.usage_available) {
+                      uint64_t high_wmark_pages = effective_memcg_high_wmark_pages(batch_memcg_budget);
+                      if (high_wmark_pages > 0) {
+                        enforce_memcg_promotion_budget = true;
+                        uint64_t huge_page_factor = PAGE_SIZE / memcg_accounting_page_size;
+                        uint64_t usage_huge_pages = batch_memcg_state.usage_pages / huge_page_factor;
+                        uint64_t high_wmark_huge_pages = high_wmark_pages / huge_page_factor;
+                        if (high_wmark_huge_pages == 0 && high_wmark_pages > 0) {
+                          high_wmark_huge_pages = 1;
                         }
-
-                        // a non zero value is returned.
-                        move_pages_errors++;
-                        if (move_pages_errors % 1000 == 0) {
-                          std::cout << " move_pages_errors " << move_pages_errors << std::endl;
+                        if (usage_huge_pages >= high_wmark_huge_pages) {
+                          promotion_headroom_pages = 0;
+                          std::cout << "[INFO] Skipping promotion batch because cgroup fast-node usage "
+                                    << usage_huge_pages
+                                    << " huge pages reached high watermark " << high_wmark_huge_pages
+                                    << " huge pages on node " << g_runtime_topology.fast_node << std::endl;
+                        } else {
+                          promotion_headroom_pages = high_wmark_huge_pages - usage_huge_pages;
                         }
                       }
-                    } 
+                    }
 
-                    // Check how much free memory we still have on node 0.
-                    uint64_t node0_free_mem_kB = get_node0_free_mem(); // in kB
+                    uint64_t num_pages_in_fast = 0;
+                    uint64_t num_pages_in_slow = 0;
+                    for (const auto &candidate_pages_for_pid : promote_candidates_by_pid) {
+                      pid_t owner_pid = candidate_pages_for_pid.first;
+                      const std::vector<uint64_t> &candidate_addresses = candidate_pages_for_pid.second;
+                      if (owner_pid <= 0 || candidate_addresses.empty()) {
+                        continue;
+                      }
+                      if (enforce_memcg_promotion_budget && promotion_headroom_pages == 0) {
+                        continue;
+                      }
+
+                      std::vector<uint64_t> pages_on_slow_node =
+                          collect_promotable_pages(owner_pid,
+                                                   candidate_addresses);
+                      num_pages_in_slow += pages_on_slow_node.size();
+                      num_pages_in_fast += candidate_addresses.size() - pages_on_slow_node.size();
+
+                      if (pages_on_slow_node.empty()) {
+                        continue;
+                      }
+                      if (enforce_memcg_promotion_budget &&
+                          pages_on_slow_node.size() > promotion_headroom_pages) {
+                        pages_on_slow_node.resize(promotion_headroom_pages);
+                      }
+                      if (pages_on_slow_node.empty()) {
+                        continue;
+                      }
+
+                      std::vector<void*> promote_ptrs(pages_on_slow_node.size());
+                      std::vector<int> promote_nodes(pages_on_slow_node.size(), g_runtime_topology.fast_node);
+                      std::vector<int> promote_status(pages_on_slow_node.size(), 99);
+                      for (size_t index = 0; index < pages_on_slow_node.size(); ++index) {
+                        promote_ptrs[index] = reinterpret_cast<void*>(pages_on_slow_node[index]);
+                      }
+
+                      printf("start promoting %ld pages for pid %d\n", pages_on_slow_node.size(), owner_pid);
+                      move_page_ret = numa_move_pages(owner_pid,
+                                                      pages_on_slow_node.size(),
+                                                      promote_ptrs.data(),
+                                                      promote_nodes.data(),
+                                                      promote_status.data(),
+                                                      MPOL_MF_MOVE_ALL);
+                      if (move_page_ret == 0) { 
+                        pages_migrated += pages_on_slow_node.size();
+                        num_pages_promoted_history += pages_on_slow_node.size();
+                        if (enforce_memcg_promotion_budget &&
+                            promotion_headroom_pages != std::numeric_limits<uint64_t>::max()) {
+                          promotion_headroom_pages -= pages_on_slow_node.size();
+                        }
+                        continue;
+                      }
+
+                      printf("move page ret %d \n", move_page_ret);
+                      std::cout << "move page error: " << errno << '\n';
+
+                      if (errno == ENOMEM && pages_on_slow_node.size() > 10) {
+                        size_t retry_count = pages_on_slow_node.size() / 10;
+                        move_page_ret = numa_move_pages(owner_pid,
+                                                        retry_count,
+                                                        promote_ptrs.data(),
+                                                        promote_nodes.data(),
+                                                        promote_status.data(),
+                                                        MPOL_MF_MOVE_ALL);
+                        printf("second promote attempt return %d\n", move_page_ret);
+                      }
+
+                      // a non zero value is returned.
+                      move_pages_errors++;
+                      if (move_pages_errors % 1000 == 0) {
+                        std::cout << " move_pages_errors " << move_pages_errors << std::endl;
+                      }
+                    }
+
+                    printf("promote candidate pages in fast tier %ld, slow tier %ld\n", num_pages_in_fast, num_pages_in_slow);
+
+                    // Check how much free memory we still have on the current fast tier node.
+                    uint64_t node0_free_mem_kB = get_node_free_mem(g_runtime_topology.fast_node); // in kB
                     std::cout << std::dec << "pages migrated: " << pages_migrated 
                               << ", lfu # items: " << lfu.get_num_elements() 
                               << ", lfu sample size: " << lfu.get_size() 
                               << ", samples: " << sample_cnt 
                               //<< ", local " << num_local_mem_samples 
                               //<< ", remote " << num_remote_mem_samples 
-                              << ", node 0 mem " << node0_free_mem_kB
-                              //<< ", lfu demote " << num_pages_lfu_demote 
+                              << ", fast tier mem " << node0_free_mem_kB
                               << std::endl;
                     lfu.print_frequency_dist();
                     momentum.print_frequency_dist();
 
                     // Not enough free memory. Trigger demotion
                     if (node0_free_mem_kB*1000 <= alloc_wmark) {
-                      // record number of pages to demote here. 
-                      uint64_t pages_to_demote = (demote_wmark - node0_free_mem_kB*1000) / PAGE_SIZE;
-                      // First check pages that were given second chance
-                      if (second_chance_queue.size() != 0) {
-                        std::chrono::steady_clock::time_point second_chance_clock_now = std::chrono::steady_clock::now();
-                        double second_chance_time_elapsed = (double)std::chrono::duration_cast<std::chrono::milliseconds>
-                                                                  (second_chance_clock_now - second_chance_clock).count();
-                        //printf("[2ndc] time since last 2nd chance %f. queue size %lu\n", second_chance_time_elapsed * 1000,  second_chance_queue.size());
-                        if (second_chance_time_elapsed / 1000 > 60) {
-                          // After some time, check second chance pages again.
-                          std::vector<uint64_t> demote_page_list;
-                          for (uint64_t k = 0; k < std::min(static_cast<uint32_t>(second_chance_queue.size()), (uint32_t)10000); k++) { // demote 10k pages at max
-                            uint64_t second_chance_page = second_chance_queue[k];
-                            uint32_t second_chance_page_oldfreq = second_chance_oldfreq[k];
-                            // The current frequency and momentum
-                            int second_chance_page_newfreq = lfu.frequency(second_chance_page);
-                            //printf("[2ndc] page %lx, old freq %d, new freq %d\n", second_chance_page,second_chance_page_oldfreq, second_chance_page_newfreq);
-                            if (second_chance_page_newfreq - second_chance_page_oldfreq < 100) {
-                              // Very few accesses sampled since last visit. Demote this page.
-                              //printf("[2ndc] 2nd chanced failed (<100 new accesses). page %lx, new freq %d \n", second_chance_page, second_chance_page_newfreq);
-                              demote_page_list.push_back(second_chance_page);
+                      MemcgNodeRuntimeState demotion_memcg_state =
+                          read_cgroup_memcg_node_runtime_state(g_cgroup_runtime_context,
+                                                               g_runtime_topology.fast_node,
+                                                               memcg_accounting_page_size);
+                      if (demotion_memcg_state.reclaimd_running_available &&
+                          demotion_memcg_state.reclaimd_running) {
+                        std::cout << "[INFO] memcg reclaimd is already running for fast node "
+                                  << g_runtime_topology.fast_node
+                                  << ". Skipping one user-space demotion cycle." << std::endl;
+                      } else {
+                        // record number of pages to demote here. 
+                        uint64_t pages_to_demote = (demote_wmark - node0_free_mem_kB*1000) / PAGE_SIZE;
+                        // First check pages that were given second chance
+                        if (second_chance_queue.size() != 0) {
+                          std::chrono::steady_clock::time_point second_chance_clock_now = std::chrono::steady_clock::now();
+                          double second_chance_time_elapsed = (double)std::chrono::duration_cast<std::chrono::milliseconds>
+                                                                    (second_chance_clock_now - second_chance_clock).count();
+                          //printf("[2ndc] time since last 2nd chance %f. queue size %lu\n", second_chance_time_elapsed * 1000,  second_chance_queue.size());
+                          if (second_chance_time_elapsed / 1000 > 60) {
+                            // After some time, check second chance pages again.
+                            std::vector<PageKey> demote_page_list;
+                            for (uint64_t k = 0; k < std::min(static_cast<uint32_t>(second_chance_queue.size()), (uint32_t)10000); k++) { // demote 10k pages at max
+                              PageKey second_chance_page = second_chance_queue[k];
+                              uint32_t second_chance_page_oldfreq = second_chance_oldfreq[k];
+                              // The current frequency and momentum
+                              int second_chance_page_newfreq = lfu.frequency(second_chance_page);
+                              //printf("[2ndc] page %lx, old freq %d, new freq %d\n", second_chance_page,second_chance_page_oldfreq, second_chance_page_newfreq);
+                              if (second_chance_page_newfreq - static_cast<int>(second_chance_page_oldfreq) < 100) {
+                                // Very few accesses sampled since last visit. Demote this page.
+                                demote_page_list.push_back(second_chance_page);
+                              }
                             }
+                            // Record time now. Perform second chance clean up roughly 10 seconds later
+                            second_chance_clock = std::chrono::steady_clock::now();
+
+                            printf("[2ndc] collected %lu second chance pages to demote (%f of all 2nd chances) \n", 
+                                    demote_page_list.size(), (float) demote_page_list.size() / (float) second_chance_queue.size());
+                            move_page_keys_to_node(demote_page_list, g_runtime_topology.first_slow_node());
+
+                            second_chance_queue.clear(); // reset queue
+                            second_chance_oldfreq.clear(); 
                           }
-                          // Record time now. Perform second chance clean up roughly 10 seconds later
-                          second_chance_clock = std::chrono::steady_clock::now();
-
-                          printf("[2ndc] collected %lu second chance pages to demote (%f of all 2nd chances) \n", 
-                                  demote_page_list.size(), (float) demote_page_list.size() / (float) second_chance_queue.size());
-                          // Actually demote the second chance pages
-                          int** demote_pages = new int*[demote_page_list.size()];
-                          int* demote_nodes = new int[demote_page_list.size()];
-                          int* demote_status = new int[demote_page_list.size()];
-                          int demote_ret; 
-
-                          for (uint64_t kk = 0; kk < demote_page_list.size(); kk++) {
-                            demote_pages[kk] = (int*)(demote_page_list[kk]);
-                            demote_nodes[kk] = 1; // Demote to node 1
-                            demote_status[kk] = 99;
-                          }
-
-                          demote_ret = numa_move_pages(0, demote_page_list.size(), (void **)demote_pages, demote_nodes, demote_status, MPOL_MF_MOVE_ALL);
-
-                          delete[] demote_pages;
-                          delete[] demote_nodes;
-                          delete[] demote_status;
-
-                          second_chance_queue.clear(); // reset queue
-                          second_chance_oldfreq.clear(); 
                         }
-                      }
 
-                      bool full_sweep_not_enough_cold_pages = false;
-                      uint64_t pages_demoted = scan_for_cold_pages(pid, hot_thresh, 
-                                                                   lfu, momentum, pages_to_demote, 
-                                                                   &last_scanned_address, &full_sweep_not_enough_cold_pages);
-                      std::cout << "pages_demoted " << pages_demoted  << std::endl;
+                        std::vector<pid_t> managed_pids;
+                        if (g_cgroup_runtime_context.enabled) {
+                          managed_pids = read_cgroup_procs(g_cgroup_runtime_context.cgroup_full_path);
+                        } else {
+                          managed_pids.push_back(pid);
+                        }
+                        DemotionScanResult demotion_result = scan_managed_pids_for_cold_pages(managed_pids,
+                                                                                             hot_thresh,
+                                                                                             lfu,
+                                                                                             momentum,
+                                                                                             pages_to_demote,
+                                                                                             last_scanned_address_by_pid);
+                        uint64_t pages_demoted = demotion_result.pages_demoted;
+                        bool full_sweep_not_enough_cold_pages = demotion_result.full_sweep_not_enough_cold_pages;
+                        std::cout << "pages_demoted " << pages_demoted  << std::endl;
 
 
-                      // Potentially throttle demotion
-                      std::chrono::steady_clock::time_point demotion_clock_now = std::chrono::steady_clock::now();
-                      double time_between_demotions_ms = (double)std::chrono::duration_cast<std::chrono::milliseconds>
-                                                                (demotion_clock_now - demotion_clock).count();
-                      double bytes_per_sec_demoted = (double)(pages_demoted * PAGE_SIZE) / (time_between_demotions_ms) * 1000;
-                      printf("Demotion rate: %f \n", bytes_per_sec_demoted);
-                      if (bytes_per_sec_demoted > 100*1024*1024 && demotion_throttle_secs < 1) { 
-                        // If larger than 50MB/s, throttle. 
-                        demotion_throttle_secs++;
-                        printf("demotion rate too high. Increase demotion throttle to %d secs.\n", demotion_throttle_secs);
-                      } else if (bytes_per_sec_demoted < 10*1024*1024 && demotion_throttle_secs > 0) {
-                        // Demoting too slowly. Decrease throttling
-                        demotion_throttle_secs--;
-                        printf("demotion rate too low. Decrease demotion throttle to %d secs.\n", demotion_throttle_secs);
-                      }
-                      // Update time we did the last demotion
-                      demotion_clock = std::chrono::steady_clock::now();
-                      // Perform throttling
-                      if (demotion_throttle_secs > 0){ 
-                        std::this_thread::sleep_for(std::chrono::seconds(demotion_throttle_secs));
-                      }
-                      // Throttling done
+                        // Potentially throttle demotion
+                        std::chrono::steady_clock::time_point demotion_clock_now = std::chrono::steady_clock::now();
+                        double time_between_demotions_ms = (double)std::chrono::duration_cast<std::chrono::milliseconds>
+                                                                  (demotion_clock_now - demotion_clock).count();
+                        double bytes_per_sec_demoted = (double)(pages_demoted * PAGE_SIZE) / (time_between_demotions_ms) * 1000;
+                        printf("Demotion rate: %f \n", bytes_per_sec_demoted);
+                        if (bytes_per_sec_demoted > 100*1024*1024 && demotion_throttle_secs < 1) { 
+                          // If larger than 50MB/s, throttle. 
+                          demotion_throttle_secs++;
+                          printf("demotion rate too high. Increase demotion throttle to %d secs.\n", demotion_throttle_secs);
+                        } else if (bytes_per_sec_demoted < 10*1024*1024 && demotion_throttle_secs > 0) {
+                          // Demoting too slowly. Decrease throttling
+                          demotion_throttle_secs--;
+                          printf("demotion rate too low. Decrease demotion throttle to %d secs.\n", demotion_throttle_secs);
+                        }
+                        // Update time we did the last demotion
+                        demotion_clock = std::chrono::steady_clock::now();
+                        // Perform throttling
+                        if (demotion_throttle_secs > 0){ 
+                          std::this_thread::sleep_for(std::chrono::seconds(demotion_throttle_secs));
+                        }
+                        // Throttling done
 
-                      if (pages_demoted < pages_to_demote) {
-                        // Finished one sweep of address space and demoted all cold pages we found.
-                        last_scanned_address = 0;
-                        std::cout << "[INFO] Finished one sweep of address space. " << std::endl;
-                      }
-                      if (full_sweep_not_enough_cold_pages_once && full_sweep_not_enough_cold_pages) {
-                        std::cout << "[INFO] Finished two demotion sweeps and found no cold pages. Go to monitor mode. " << std::endl;
-                        demotion_reset_count = 0;
-                        low_overhead_monitor();
-                        // Aging here makes sense. At this point, there are likely no more cold pages in node 0 DRAM.
-                        // Without aging, it would be pointless to restart sampling since we cannot find more cold pages anyway.
-                        //std::cout << "[INFO] Aging frequency CBF twice (divide all counters by 4)" << std::endl;
-                        //lfu.age();
-                        lfu.age();
-                        momentum.age();
-                        // Reset 2nd chance queues after aging, since the page frequencies are now lower than before
-                        second_chance_queue.clear(); 
-                        second_chance_oldfreq.clear(); 
-                        printf("Clearing 2nd chance queue \n");
-                        // Wake up with less aggressive sampling frequency. Give the workload a chance to settle into 
-                        // monitoring mode.
-                        // Reset hot threshold since it may have been reduced due to promotion plateau
-                        hot_thresh = initial_hot_thresh;
-                        printf("Reset hot threshold to %d \n", hot_thresh);
-                        //perf_sample_freq = perf_sample_freq_list[3];
-                        full_sweep_not_enough_cold_pages_once = false; // Reset
-                        goto perf_sampling_start;
-                      } else if (!full_sweep_not_enough_cold_pages_once && full_sweep_not_enough_cold_pages)  {
-                        // Record the fact that we performed a full demotion sweep and did not find any cold pages.
-                        full_sweep_not_enough_cold_pages_once = true;
-                        std::cout << "Record 1/2 full sweep with no cold pages " << std::endl;
-                      } else if (full_sweep_not_enough_cold_pages_once && !full_sweep_not_enough_cold_pages)  {
-                        // If the previous demotion sweep did not find enough cold pages and we were able to find more cold
-                        // pages in this sweep, clear flag since we are looking for two consecutive full sweeps. 
-                        full_sweep_not_enough_cold_pages_once = false;
-                        demotion_reset_count++;
-                        std::cout << "Reset. Waiting for two consecutive sweeps. Reset count " << demotion_reset_count << std::endl;
-                        if (demotion_reset_count == 10) {
-                          std::cout << "sweeped address space 10 times and still cold pages left. Give up for now. Entering monitor mode." << std::endl;
+                        if (pages_demoted < pages_to_demote) {
+                          std::cout << "[INFO] Finished one sweep of address space. " << std::endl;
+                        }
+                        if (full_sweep_not_enough_cold_pages_once && full_sweep_not_enough_cold_pages) {
+                          std::cout << "[INFO] Finished two demotion sweeps and found no cold pages. Go to monitor mode. " << std::endl;
+                          demotion_reset_count = 0;
                           low_overhead_monitor();
                           lfu.age();
                           momentum.age();
-                          demotion_reset_count = 0;
-                          full_sweep_not_enough_cold_pages_once = false; // Reset
-                          hot_thresh = initial_hot_thresh;
-                          printf("Reset hot threshold to %d \n", hot_thresh);
                           // Reset 2nd chance queues after aging, since the page frequencies are now lower than before
                           second_chance_queue.clear(); 
                           second_chance_oldfreq.clear(); 
                           printf("Clearing 2nd chance queue \n");
+                          // Wake up with less aggressive sampling frequency. Give the workload a chance to settle into 
+                          // monitoring mode.
+                          // Reset hot threshold since it may have been reduced due to promotion plateau
+                          hot_thresh = initial_hot_thresh;
+                          printf("Reset hot threshold to %d \n", hot_thresh);
+                          //perf_sample_freq = perf_sample_freq_list[3];
+                          full_sweep_not_enough_cold_pages_once = false; // Reset
                           goto perf_sampling_start;
+                        } else if (!full_sweep_not_enough_cold_pages_once && full_sweep_not_enough_cold_pages)  {
+                          // Record the fact that we performed a full demotion sweep and did not find any cold pages.
+                          full_sweep_not_enough_cold_pages_once = true;
+                          std::cout << "Record 1/2 full sweep with no cold pages " << std::endl;
+                        } else if (full_sweep_not_enough_cold_pages_once && !full_sweep_not_enough_cold_pages)  {
+                          // If the previous demotion sweep did not find enough cold pages and we were able to find more cold
+                          // pages in this sweep, clear flag since we are looking for two consecutive full sweeps. 
+                          full_sweep_not_enough_cold_pages_once = false;
+                          demotion_reset_count++;
+                          std::cout << "Reset. Waiting for two consecutive sweeps. Reset count " << demotion_reset_count << std::endl;
+                          if (demotion_reset_count == 10) {
+                            std::cout << "sweeped address space 10 times and still cold pages left. Give up for now. Entering monitor mode." << std::endl;
+                            low_overhead_monitor();
+                            lfu.age();
+                            momentum.age();
+                            demotion_reset_count = 0;
+                            full_sweep_not_enough_cold_pages_once = false; // Reset
+                            hot_thresh = initial_hot_thresh;
+                            printf("Reset hot threshold to %d \n", hot_thresh);
+                            // Reset 2nd chance queues after aging, since the page frequencies are now lower than before
+                            second_chance_queue.clear(); 
+                            second_chance_oldfreq.clear(); 
+                            printf("Clearing 2nd chance queue \n");
+                            goto perf_sampling_start;
+                          }
                         }
                       }
                     }
@@ -1260,7 +1498,7 @@ perf_done_one_sample:
             if (perf_sample_freq_local > 20000) { // minimum 20kHz
               perf_sample_freq_local = perf_sample_freq_local / 2;
               printf("frac of unuseful samples too high. Dropping fast tier sampling frequency to %llu \n", perf_sample_freq_local);
-              for (int ii = 0; ii < NPROC; ii++) {
+              for (size_t ii = 0; ii < g_monitored_cpus.size(); ii++) {
                 change_perf_freq(ii, LOCAL_DRAM_LOAD, perf_sample_freq_local);
               }
               drop_local_sample_freq = false;
@@ -1270,7 +1508,7 @@ perf_done_one_sample:
           // Try sleeping more, since we are not getting that many samples from each counter
           std::this_thread::sleep_for(std::chrono::microseconds(2000));
         } // for(int j = 0; j < NPBUFTYPES; j++)
-      } // for (int i = 0; i < NPROC; i++)
+      } // for (int i = 0; i < monitored cpu count; i++)
     }
 
   //outfile.close();

@@ -10,6 +10,65 @@ DAMO_KERNEL_VER="5.19.17"
 PERF_EXE="/ssd1/songxin8/thesis/autonuma/linux-v6.2-autonuma/tools/perf/perf"
 PERF_STAT_PID=
 
+configure_optional_memcg_node_budget() {
+  local fast_tier_size_gb="$1"
+  local cgroup_path="${HYBRIDTIER_MEMCG_PATH:-}"
+  local fast_node_id="${HYBRIDTIER_MEMCG_FAST_NODE:-}"
+  local page_size capacity_pages low_pages high_pages kswapd_mode
+
+  if [ -z "${cgroup_path}" ] || [ -z "${fast_node_id}" ]; then
+    return 0
+  fi
+
+  if [ ! -d "${cgroup_path}" ]; then
+    echo "[WARN] HYBRIDTIER_MEMCG_PATH does not exist: ${cgroup_path}. Skipping memcg node budget configuration."
+    return 0
+  fi
+
+  if [ ! -e "${cgroup_path}/memory.node_capacity" ]; then
+    echo "[INFO] memory.node_capacity is not available at ${cgroup_path}. Skipping memcg node budget configuration."
+    return 0
+  fi
+
+  page_size=$(getconf PAGESIZE 2>/dev/null || echo 4096)
+  capacity_pages="${HYBRIDTIER_MEMCG_NODE_CAPACITY_PAGES:-}"
+  if [ -z "${capacity_pages}" ] && [ -n "${fast_tier_size_gb}" ] && [ "${fast_tier_size_gb}" != "0" ]; then
+    capacity_pages=$((fast_tier_size_gb * 1024 * 1024 * 1024 / page_size))
+  fi
+
+  if [ -z "${capacity_pages}" ] || [ "${capacity_pages}" -le 0 ]; then
+    echo "[WARN] No valid memcg node capacity could be derived. Set HYBRIDTIER_MEMCG_NODE_CAPACITY_PAGES or FAST_TIER_SIZE_GB."
+    return 0
+  fi
+
+  low_pages="${HYBRIDTIER_MEMCG_NODE_LOW_WMARK_PAGES:-$((capacity_pages * 90 / 100))}"
+  high_pages="${HYBRIDTIER_MEMCG_NODE_HIGH_WMARK_PAGES:-$((capacity_pages * 95 / 100))}"
+  if [ "${low_pages}" -gt "${high_pages}" ] || [ "${high_pages}" -gt "${capacity_pages}" ]; then
+    echo "[WARN] Invalid memcg watermark configuration: low=${low_pages}, high=${high_pages}, capacity=${capacity_pages}. Skipping."
+    return 0
+  fi
+
+  echo "[INFO] Configuring memcg node budget at ${cgroup_path}: node=${fast_node_id}, capacity=${capacity_pages}, low=${low_pages}, high=${high_pages}"
+  if [ -w "${cgroup_path}/memory.node_capacity" ]; then
+    printf '%s %s\n' "${fast_node_id}" "${capacity_pages}" > "${cgroup_path}/memory.node_capacity"
+  else
+    echo "[WARN] ${cgroup_path}/memory.node_capacity is not writable. Skipping."
+    return 0
+  fi
+
+  if [ -w "${cgroup_path}/memory.node_low_wmark" ]; then
+    printf '%s %s\n' "${fast_node_id}" "${low_pages}" > "${cgroup_path}/memory.node_low_wmark"
+  fi
+  if [ -w "${cgroup_path}/memory.node_high_wmark" ]; then
+    printf '%s %s\n' "${fast_node_id}" "${high_pages}" > "${cgroup_path}/memory.node_high_wmark"
+  fi
+
+  kswapd_mode="${HYBRIDTIER_MEMCG_KSWAPD_DEMOTION_ENABLED:-}"
+  if [ -n "${kswapd_mode}" ] && [ -w "${cgroup_path}/memory.kswapd_demotion_enabled" ]; then
+    printf '%s\n' "${kswapd_mode}" > "${cgroup_path}/memory.kswapd_demotion_enabled"
+  fi
+}
+
 config_tiering_system() {
   TIERING_SYSTEM=$1
   if [ "$TIERING_SYSTEM" = "HYBRIDTIER" ]   ; then
@@ -74,6 +133,7 @@ run_bench () {
   echo "===== Tiering system configuration"
   config_tiering_system $TIERING_SYSTEM
   echo "===== Tiering system configuration end"
+  configure_optional_memcg_node_budget "${FAST_TIER_SIZE_GB}"
 
   write_frontmatter $LOGFILE
   start_perf_stat 10000 $LOGFILE
