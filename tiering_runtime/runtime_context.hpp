@@ -140,6 +140,26 @@ struct MemcgNodeRuntimeState {
     uint64_t usage_pages = 0;
 };
 
+struct MemcgNodeHeadroom {
+    bool valid = false;
+    uint64_t limit_pages = 0;
+    uint64_t usage_pages = 0;
+    uint64_t headroom_pages = 0;
+};
+
+struct PerfLoadEventConfig {
+    uint64_t local_load_raw = 0x1d3;
+    uint64_t local_load_config1 = 0;
+    uint64_t slow_load_raw = 0x2d3;
+    uint64_t slow_load_config1 = 0;
+    std::string pmu_name = "unknown";
+    std::string local_label = "MEM_LOAD_L3_MISS_RETIRED.LOCAL_DRAM";
+    std::string slow_label = "MEM_LOAD_L3_MISS_RETIRED.REMOTE_DRAM";
+    bool slow_node_is_cxl = false;
+    bool slow_event_is_cxl_specific = false;
+    bool slow_event_is_generic_mem_loads = false;
+};
+
 inline bool read_file_first_line(const std::string& path, std::string* out) {
     std::ifstream file(path);
     if (!file) {
@@ -147,6 +167,39 @@ inline bool read_file_first_line(const std::string& path, std::string* out) {
     }
     std::getline(file, *out);
     return true;
+}
+
+inline bool node_is_dax_target(int node_id) {
+    if (node_id < 0) {
+        return false;
+    }
+
+    DIR* dir = opendir("/sys/bus/dax/devices");
+    if (dir == nullptr) {
+        return false;
+    }
+
+    bool is_target = false;
+    struct dirent* entry = nullptr;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+
+        std::string target_node_value;
+        std::string target_node_path =
+            std::string("/sys/bus/dax/devices/") + entry->d_name + "/target_node";
+        if (!read_file_first_line(target_node_path, &target_node_value)) {
+            continue;
+        }
+        if (std::stoi(target_node_value) == node_id) {
+            is_target = true;
+            break;
+        }
+    }
+
+    closedir(dir);
+    return is_target;
 }
 
 inline uint64_t read_hex_file_u64(const std::string& path) {
@@ -540,6 +593,85 @@ inline MemcgNodeRuntimeState read_cgroup_memcg_node_runtime_state(const CgroupRu
         }
     }
     return state;
+}
+
+inline MemcgNodeHeadroom read_cgroup_memcg_node_headroom(const CgroupRuntimeContext& context,
+                                                         int node_id,
+                                                         uint64_t accounting_page_size) {
+    MemcgNodeHeadroom headroom;
+    MemcgNodeBudget budget = read_cgroup_memcg_node_budget(context, node_id);
+    MemcgNodeRuntimeState state =
+        read_cgroup_memcg_node_runtime_state(context, node_id, accounting_page_size);
+    if (!budget.configured || !state.usage_available) {
+        return headroom;
+    }
+
+    uint64_t limit_pages = budget.high_wmark_pages > 0 ? budget.high_wmark_pages : budget.capacity_pages;
+    if (limit_pages == 0) {
+        return headroom;
+    }
+
+    headroom.valid = true;
+    headroom.limit_pages = limit_pages;
+    headroom.usage_pages = state.usage_pages;
+    if (state.usage_pages >= limit_pages) {
+        headroom.headroom_pages = 0;
+    } else {
+        headroom.headroom_pages = limit_pages - state.usage_pages;
+    }
+    return headroom;
+}
+
+inline uint64_t compute_demotion_target_pages(uint64_t demote_wmark_bytes,
+                                              uint64_t available_bytes,
+                                              uint64_t migration_granularity_bytes) {
+    if (migration_granularity_bytes == 0 || available_bytes >= demote_wmark_bytes) {
+        return 0;
+    }
+
+    uint64_t deficit_bytes = demote_wmark_bytes - available_bytes;
+    uint64_t pages_to_demote = deficit_bytes / migration_granularity_bytes;
+    if (pages_to_demote == 0 && deficit_bytes > 0) {
+        pages_to_demote = 1;
+    }
+    return pages_to_demote;
+}
+
+inline PerfLoadEventConfig detect_perf_load_event_config(const RuntimeTopology& topology) {
+    PerfLoadEventConfig config;
+    read_file_first_line("/sys/bus/event_source/devices/cpu/caps/pmu_name", &config.pmu_name);
+
+    int slow_node = topology.first_slow_node();
+    config.slow_node_is_cxl = node_is_dax_target(slow_node);
+    if (!config.slow_node_is_cxl) {
+        return config;
+    }
+
+    // Sapphire/Emerald Rapids expose REMOTE_DRAM and REMOTE_PMM, but not a distinct
+    // REMOTE_CXL_MEM core PEBS event for system-ram CXL. Granite Rapids adds it.
+    if (config.pmu_name == "granite_rapids" || config.pmu_name == "graniterapids") {
+        config.slow_load_raw = 0x10d3;
+        config.slow_label = "MEM_LOAD_L3_MISS_RETIRED.REMOTE_CXL_MEM";
+        config.slow_event_is_cxl_specific = true;
+    } else {
+        // On SPR/EMR system-ram CXL, the generic mem-loads PEBS stream still captures
+        // CXL addresses while REMOTE_DRAM does not. Use ldlat=3 to mirror the kernel alias.
+        config.slow_load_raw = 0x1cd;
+        config.slow_load_config1 = 3;
+        config.slow_label = "MEM_LOADS(ldlat=3)";
+        config.slow_event_is_generic_mem_loads = true;
+    }
+    return config;
+}
+
+inline uint64_t normalize_perf_sample_freq(const CgroupRuntimeContext& context,
+                                           uint64_t requested_freq) {
+    if (!context.enabled) {
+        return requested_freq;
+    }
+
+    const uint64_t max_cgroup_precise_freq = 1000;
+    return std::min<uint64_t>(requested_freq, max_cgroup_precise_freq);
 }
 
 inline uint64_t resolve_fast_memory_size_bytes(uint64_t fallback_fast_memory_size_bytes,
