@@ -666,6 +666,7 @@ uint64_t get_node_free_mem(int node_id) {
 
 void low_overhead_monitor() {
   if (g_cgroup_runtime_context.enabled) {
+    close_perf();
     std::cout << "[INFO] Skipping perf-stat monitor path in cgroup-scoped mode." << std::endl;
     return;
   }

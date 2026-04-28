@@ -642,6 +642,7 @@ uint32_t check_fast_mem_hit_ratio(int cur_sampling_freq) {
 
 void low_overhead_monitor() {
   if (g_cgroup_runtime_context.enabled) {
+    close_perf();
     std::cout << "[INFO] Skipping perf-stat monitor path in cgroup-scoped mode." << std::endl;
     return;
   }

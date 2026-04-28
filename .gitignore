@@ -10,3 +10,13 @@ memtis/results/
 perf_stat_file
 repro_results.csv
 
+# Local agent/session files
+.codex
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+
+# Host HybridTier sweep outputs and external datasets
+host_hybridtier_mode4_sweeps/
+kdd12.model
